@@ -119,9 +119,20 @@ def _read_sheet_rows(path, sheet_name=None):
             out.append(tuple(row))
         return out
 
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
-    return list(ws.iter_rows(values_only=True))
+    if magic.startswith(b'PK'):  # современный .xlsx (zip), даже если имя файла .xls
+        import io
+        with open(path, 'rb') as f:
+            data = f.read()
+        # читаем из памяти, чтобы openpyxl не проверял расширение имени файла
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
+        return list(ws.iter_rows(values_only=True))
+
+    raise ValueError(
+        "Не удалось определить формат файла (не .xlsx и не .xls). "
+        f"Первые байты файла: {magic!r}. Откройте файл в Excel и сохраните "
+        "как «Книга Excel (*.xlsx)», затем отправьте снова."
+    )
 
 
 def load_rows(path, sheet_name=None):
