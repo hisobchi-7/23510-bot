@@ -35,13 +35,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, date
 import calendar as _calendar_module
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
 
 import analyze_commissions as ac
+import convert_cb
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,6 +59,14 @@ if not BOT_TOKEN:
     )
 
 DOWNLOAD_DIR = 'bot_files'
+
+# Постоянные кнопки под полем ввода (вместо набора /convert и /start вручную)
+BTN_CALC = "📊 Расчёт комиссий"
+BTN_CONVERT = "🧾 Оформить выписку"
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(BTN_CALC), KeyboardButton(BTN_CONVERT)]],
+    resize_keyboard=True, is_persistent=True,
+)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Сколько секунд ждать после получения файла, прежде чем считать, что
@@ -114,17 +126,76 @@ def build_calendar(purpose, year, month, selected_start=None):
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['mode'] = None  # выход из режима /convert
     await update.message.reply_text(
         "Привет! Пришлите один или несколько xlsx-файлов банковской выписки "
         "(SmartVista или HUMO — формат определю автоматически для каждого).\n\n"
         "После того как файлы получены, я спрошу за какой период считать — "
         "через календарь (можно выбрать день, декаду или целый месяц).\n\n"
         "Результаты по всем файлам будут собраны в один сводный xlsx-файл "
-        "и присланы сюда же."
+        "и присланы сюда же.\n\n"
+        "Команда /convert — оформить выписку в аккуратную таблицу Excel "
+        "(фильтры, итоги), без расчёта комиссий.\n"
+        "Или нажмите кнопку внизу.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
+async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отдельная функция: оформление выписки в аккуратный .xlsx (без расчёта)."""
+    context.user_data['mode'] = 'convert'
+    await update.message.reply_text(
+        "Режим «Оформление выписки» включён.\n\n"
+        "Пришлите один или несколько файлов выписки (.xls или .xlsx) — "
+        "верну каждый в виде аккуратной таблицы Excel с фильтрами и итогами. "
+        "Расчёт комиссий в этом режиме не выполняется.\n\n"
+        "Чтобы вернуться к расчёту комиссий, нажмите кнопку «" + BTN_CALC + "».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Расчёт комиссий»: обычный режим (расчёт по выпискам)."""
+    context.user_data['mode'] = None
+    await update.message.reply_text(
+        "Режим «Расчёт комиссий» включён. Пришлите один или несколько файлов "
+        "выписки (.xlsx / .xls) — потом выберете период в календаре.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def handle_convert_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    name = doc.file_name or 'file'
+    if not name.lower().endswith(('.xlsx', '.xls')):
+        await update.message.reply_text("Пришлите файл в формате .xlsx или .xls")
+        return
+
+    local_path = os.path.join(DOWNLOAD_DIR, f"cv_{doc.file_unique_id}_{name}")
+    out_path = None
+    try:
+        file = await doc.get_file()
+        await file.download_to_drive(local_path)
+        # тяжёлая работа - в отдельном потоке, чтобы бот не "замирал"
+        out_path, count = await asyncio.to_thread(convert_cb.convert, local_path)
+        base = os.path.splitext(name)[0]
+        with open(out_path, 'rb') as fh:
+            await update.message.reply_document(
+                document=fh, filename=f"{base}_оформлен.xlsx",
+                caption=f"✅ {name}: строк в таблице — {count}")
+    except Exception as e:
+        logger.exception(f"Ошибка оформления файла {name}")
+        await update.message.reply_text(f"❌ Ошибка при оформлении {name}: {e}")
+    finally:
+        for pth in (local_path, out_path):
+            if pth and os.path.exists(pth):
+                os.remove(pth)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('mode') == 'convert':
+        await handle_convert_document(update, context)
+        return
     doc = update.message.document
     if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
         await update.message.reply_text("Пришлите файл в формате .xlsx или .xls")
@@ -342,10 +413,25 @@ def keep_alive():
     logger.info(f"Keep-alive server {port}-portda ishga tushdi")
 
 
+async def _set_menu(application):
+    """Показывает команды в меню Telegram (кнопка «/» рядом с полем ввода)."""
+    from telegram import BotCommand
+    try:
+        await application.bot.set_my_commands([
+            BotCommand('start', 'Расчёт комиссий по выпискам'),
+            BotCommand('convert', 'Оформить выписку в таблицу Excel'),
+        ])
+    except Exception:
+        logger.exception("Не удалось установить меню команд")
+
+
 def main():
     keep_alive()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_set_menu).build()
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('convert', convert_command))
+    app.add_handler(MessageHandler(filters.Text([BTN_CONVERT]), convert_command))
+    app.add_handler(MessageHandler(filters.Text([BTN_CALC]), calc_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_calendar_callback, pattern=r'^cal\|'))
     app.add_error_handler(error_handler)
