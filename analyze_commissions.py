@@ -90,13 +90,46 @@ def extract_rrn(text):
 COMPANY_INN_RE = re.compile(r'ИНН\s*:\s*(\d+)')
 
 
-def load_rows(path, sheet_name=None):
+def _read_sheet_rows(path, sheet_name=None):
+    """Возвращает все строки листа как список кортежей значений.
+    Поддерживает и .xlsx (openpyxl), и старый .xls (xlrd)."""
+    with open(path, 'rb') as f:
+        magic = f.read(8)
+
+    if magic.startswith(b'\xd0\xcf\x11\xe0'):  # старый бинарный формат .xls
+        import xlrd
+        book = xlrd.open_workbook(path)
+        sh = book.sheet_by_name(sheet_name) if sheet_name else book.sheet_by_index(0)
+        out = []
+        for r in range(sh.nrows):
+            row = []
+            for c in range(sh.ncols):
+                cell = sh.cell(r, c)
+                v = cell.value
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    v = xlrd.xldate.xldate_as_datetime(v, book.datemode)
+                elif cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK,
+                                    xlrd.XL_CELL_ERROR):
+                    v = None
+                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                    v = bool(v)
+                elif cell.ctype == xlrd.XL_CELL_NUMBER and float(v).is_integer():
+                    v = int(v)  # как в openpyxl: 123.0 -> 123
+                row.append(v)
+            out.append(tuple(row))
+        return out
+
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
+    return list(ws.iter_rows(values_only=True))
+
+
+def load_rows(path, sheet_name=None):
+    all_rows = _read_sheet_rows(path, sheet_name)
 
     header_row = None
     company_inn = None
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=15, values_only=True), start=1):
+    for i, row in enumerate(all_rows[:15], start=1):
         if row and isinstance(row[0], str) and company_inn is None:
             m = COMPANY_INN_RE.search(row[0])
             if m:
@@ -108,7 +141,7 @@ def load_rows(path, sheet_name=None):
         raise ValueError("Не найдена строка заголовков ('Дата', ..., 'Назначение платежа')")
 
     rows = []
-    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+    for row in all_rows[header_row:]:
         date_cell, acc, doc, op, mfo, debit, credit, purpose = (list(row) + [None] * 8)[:8]
         if not isinstance(date_cell, datetime):
             continue

@@ -127,7 +127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-        await update.message.reply_text("Пришлите файл в формате .xlsx")
+        await update.message.reply_text("Пришлите файл в формате .xlsx или .xls")
         return
 
     local_path = os.path.join(DOWNLOAD_DIR, f"{doc.file_unique_id}_{doc.file_name}")
