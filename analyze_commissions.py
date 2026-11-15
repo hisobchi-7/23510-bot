@@ -128,11 +128,105 @@ def _read_sheet_rows(path, sheet_name=None):
         ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
         return list(ws.iter_rows(values_only=True))
 
+    head = magic.lstrip(b'\xef\xbb\xbf \t\r\n')[:1]
+    if head == b'<':  # HTML-таблица с расширением .xls (выгрузка Клиент-Банка)
+        return _read_html_rows(path)
+
     raise ValueError(
         "Не удалось определить формат файла (не .xlsx и не .xls). "
         f"Первые байты файла: {magic!r}. Откройте файл в Excel и сохраните "
         "как «Книга Excel (*.xlsx)», затем отправьте снова."
     )
+
+
+_HTML_DT_RE = re.compile(r'^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?$')
+
+
+def _html_number(text):
+    """'3 034 174.49' / '169 600.00' -> float; пусто -> None."""
+    t = (text or '').replace('\xa0', '').replace(' ', '').replace(',', '.')
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _read_html_rows(path):
+    """Читает выписку, сохранённую банком как HTML-таблица (файл .xls, но
+    внутри HTML). Возвращает строки в том же виде, что и для настоящего xlsx:
+    дата -> datetime, сумма -> float, № док и Оп -> int."""
+    from html.parser import HTMLParser
+
+    with open(path, 'rb') as f:
+        raw = f.read()
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        text = raw.decode('cp1251', errors='replace')  # так отдаёт Клиент-Банк
+
+    class _TableParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.rows = []
+            self._row = None
+            self._cell = None
+
+        def _flush_row(self):
+            # у банка строка заголовка бывает не закрыта тегом </tr> -
+            # поэтому сохраняем незакрытую строку, когда начинается следующая
+            if self._cell is not None and self._row is not None:
+                self._row.append(''.join(self._cell).strip())
+            self._cell = None
+            if self._row is not None:
+                self.rows.append(self._row)
+            self._row = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == 'tr':
+                self._flush_row()
+                self._row = []
+            elif tag in ('td', 'th'):
+                if self._cell is not None and self._row is not None:
+                    self._row.append(''.join(self._cell).strip())
+                self._cell = []
+
+        def handle_endtag(self, tag):
+            if tag in ('td', 'th') and self._cell is not None and self._row is not None:
+                self._row.append(''.join(self._cell).strip())
+                self._cell = None
+            elif tag in ('tr', 'thead', 'tbody', 'table'):
+                self._flush_row()
+
+        def handle_data(self, data):
+            if self._cell is not None:
+                self._cell.append(data)
+
+    parser = _TableParser()
+    parser.feed(text)
+
+    out = []
+    for row in parser.rows:
+        m = _HTML_DT_RE.match(row[0]) if row else None
+        if m and len(row) >= 8:
+            d, mo, y, H, Mi, S = m.groups()
+            dt = datetime(int(y), int(mo), int(d), int(H or 0), int(Mi or 0), int(S or 0))
+            doc = row[2].strip()
+            op = row[3].strip()
+            out.append((
+                dt,
+                row[1],
+                int(doc) if doc.isdigit() else doc,
+                int(op) if op.isdigit() else op,
+                row[4],
+                _html_number(row[5]),
+                _html_number(row[6]),
+                row[7],
+            ))
+        else:
+            out.append(tuple(row))
+    return out
 
 
 def load_rows(path, sheet_name=None):
